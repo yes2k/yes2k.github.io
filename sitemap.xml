@@ -1,11 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>
-    <loc>https://yes2k.github.io/index.html</loc>
-    <lastmod>2025-10-07T00:02:07.344Z</lastmod>
+    <loc>https://yes2k.github.io/posts/nhl_goal_modelling/index.html</loc>
+    <lastmod>2025-10-07T01:27:44.491Z</lastmod>
   </url>
   <url>
-    <loc>https://yes2k.github.io/about.html</loc>
-    <lastmod>2025-10-07T00:02:07.642Z</lastmod>
+    <loc>https://yes2k.github.io/index.html</loc>
+    <lastmod>2025-10-07T01:27:44.764Z</lastmod>
+  </url>
+  <url>
+    <loc>https://yes2k.github.io/posts.html</loc>
+    <lastmod>2025-10-07T01:27:45.077Z</lastmod>
   </url>
 </urlset>
