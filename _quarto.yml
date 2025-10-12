@@ -2,12 +2,12 @@ project:
   type: website
 
 website:
-  title: "t"
+  title: "Y.K"
   navbar:
     left:
       - href: index.qmd
         text: Home
-      - about.qmd
+      - posts.qmd
 
 format:
   html:
