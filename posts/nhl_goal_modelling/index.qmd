@@ -1,0 +1,607 @@
+---
+title: "Modelling NHL Goals using Hierarchical Poisson Model Using Stan"
+author: "Yatharth Khattar"
+format:
+  html:
+    code-fold: true
+    code-summary: "Show/Hide Code"
+date: "2024-10-06"
+execute: 
+  warning: false
+  error: false
+  output: false
+  freeze: auto
+  image: "latent_var_plot.png"
+---
+
+```{r}
+library(tidyverse)
+library(cmdstanr)
+library(bayesplot)
+library(posterior)
+library(here)
+library(loo)
+library(cowplot)
+library(furrr)
+library(knitr)
+library(httr)
+theme_set(theme_classic())
+set_cmdstan_path()
+set.seed(123)
+```
+
+
+## Introduction
+
+In this article I'm going to describe how I model NHL goals in Stan using a Hierarchical Poisson Model. My starting point for this was that I wanted to try and predict who will win an NHL game. One of the simplest models to do this is called a [Bradley-Terry Model](https://en.wikipedia.org/wiki/Bradley%E2%80%93Terry_model), which is type of model that ranks variables based on pairwise outcomes. So you could take the wins and loses for every game in the NHL and each team would get a "score" which would represent their skill level compared other teams. It's very similar to the ELO rating system.
+
+When it comes to hockey games we have more information about the outcome of a game, i.e.  the number of goals each team scored. Rather than just looking at wins and losses, we can predict the outcome of a hockey game by modelling the number of goals a team scores. We can go much deeper with hockey (shots, penalties, simulating other events), but it's always a good idea to start simple and add complexity later on.
+
+## The Model
+
+Lets define some variables:
+
+* $Y_{i}^{(h)}$: A random variable that represents number of goals scored by the home team in the $i$th game of the season
+* $att_{h[i]}$: A latent variable that represents the "offensive ability" of the home team to score goals
+* $def_{a[i]}$: A latent variable that represents the "defensive ability" of the away team to suppress goal scoring.
+* $is\_home$: An indicator variable that is 1 if the team is at home and 0 otherwise.
+
+The model
+
+$$
+\begin{aligned}
+Y_{i}^{(h)} &\thicksim \text{Poisson}(\lambda_i) \\
+\log \lambda_i &= \beta_0 + \beta_1 is\_home + att_{h[i]} + def_{a[i]} \\
+att_{h[i]} &\thicksim \mathcal{N}(0, \sigma^2_{a}) \\
+def_{a[i]} &\thicksim \mathcal{N}(0, \sigma^2_{d}) 
+\end{aligned}
+$$ {#eq-home_model}
+
+The above is defined for the goals scored by the home team but we can do the same thing for away team goals:
+
+$$
+\begin{aligned}
+Y_{i}^{(a)} &\thicksim \text{Poisson}(\lambda_i) \\
+\log \lambda_i &= \beta_0 + att_{a[i]} + def_{h[i]} \\
+att_{a[i]} &\thicksim \mathcal{N}(0, \sigma^2_{a}) \\
+def_{h[i]} &\thicksim \mathcal{N}(0, \sigma^2_{d}) 
+\end{aligned}
+$$ {#eq-away_model}
+
+The only difference between home model(@eq-home_model) and away_model(@eq-away_model) is the swapping of which team is attacking and defending and the lack of a $is\_home$ variable in away_model(@eq-away_model)
+
+To fit the model, we'll be using data from the 2024-2025 regular season.
+
+```{r}
+#| output: true
+
+df <- read_rds(here("posts", "nhl_goal_modelling", "nhl_2425_goal.rds"))
+knitr::kable(df$model_df |> arrange(game_id) |> head(), format = "html")
+
+```
+
+Each row represents a single game and we the names of the home and away team under the `home_team` and `away_team` columns, and the number of goals under the `home_goals` and `away_goals` columns. Note that these are the final scores of the game, which would include goals scored in overtime and the shootout result. A possible extension of this model would be to model the OT and shootout separately.
+
+## Fitting the Model in Stan
+
+Coding up the model in Stan we get:
+
+```{r}
+#| output: true
+writeLines(readLines(here("posts", "nhl_goal_modelling", "model.stan")))
+```
+
+Now before we fit the model, we have to set some priors for our parameters. I don't really have any information about what the parameters could be, but the we do have information about the $Y_i$'s, the number of goals scored in regulation time in a single game. In the vast majority of games, a single team is probably going to be scoring less than 10 goals, around 0-5 is more likely. This gives us an likely upperbound for our $\lambda$ parameter: $\lambda \leq 10 \Rightarrow \log \lambda \leq 2.3$. We are not trying to be too precise here, it's just to make sure that priors are not too wide to allow for unrealistic goal senarios.
+
+The parameters that we need to set a prior on are $\beta_0$, $\beta_1$, $\sigma^2_{a}$, $\sigma^2_{h}$.
+
+-   The prior for $\beta_0$ and $\beta_1$ will be $\mathcal{N}(0, 1)$
+-   The prior for $\sigma^2_{a}$, $\sigma^2_{h}$ will be $\mathcal{N}_+(0, 1)$
+
+To see the effect of these priors, we can do a prior predicitve check.
+
+```{r}
+#| output: true
+
+data_list <- list(
+  N = df$model_df |> nrow(),
+  n_teams = df$team_id |> nrow(),
+  home_teams = df$model_df$home_id,
+  away_teams = df$model_df$away_id,
+  home_goals = df$model_df$home_goals,
+  away_goals = df$model_df$away_goals,
+  only_prior = 1,
+  N_new = 1,
+  home_new = 10,
+  away_new = 11
+)
+
+model <- cmdstan_model(here("posts", "nhl_goal_modelling", "model.stan"))
+model_fit_prior <- model$sample(
+  data = data_list,
+  parallel_chains = 4,
+  refresh = 0
+)
+
+
+model_fit_prior$draws(c("fit_home_goals")) |>
+  as_draws_df() |>
+  select(sample(5:1315, 10)) |>
+  pivot_longer(cols = everything()) |>
+  ggplot(aes(x = value)) +
+  geom_histogram() +
+  facet_wrap(~name) +
+  xlim(0, 20)
+
+model_fit_prior$draws(c("fit_away_goals")) |>
+  as_draws_df() |>
+  select(sample(5:1315, 10)) |>
+  pivot_longer(cols = everything()) |>
+  ggplot(aes(x = value)) +
+  geom_histogram() +
+  facet_wrap(~name) +
+  xlim(0, 20)
+
+
+cat(
+  "Pr(home goals >= 10):",
+  model_fit_prior$draws(c("fit_home_goals")) |>
+    as_draws_df() |>
+    select(4:1315) |>
+    (\(x) {
+      round(100 * mean(x >= 10), 2)
+    })(x = _),
+  "%\n"
+)
+
+cat(
+  "Pr(home goals >= 20):",
+  model_fit_prior$draws(c("fit_home_goals")) |>
+    as_draws_df() |>
+    select(4:1315) |>
+    (\(x) {
+      round(100 * mean(x >= 20), 2)
+    })(x = _),
+  "%\n"
+)
+
+cat(
+  "Pr(away goals >= 10):",
+  model_fit_prior$draws(c("fit_away_goals")) |>
+    as_draws_df() |>
+    select(4:1315) |>
+    (\(x) {
+      round(100 * mean(x >= 10), 2)
+    })(x = _),
+  "%\n"
+)
+
+cat(
+  "Pr(away goals >= 20):",
+  model_fit_prior$draws(c("fit_away_goals")) |>
+    as_draws_df() |>
+    select(4:1315) |>
+    (\(x) {
+      round(100 * mean(x >= 20), 2)
+    })(x = _),
+  "%\n"
+)
+
+```
+
+Looking at the prior predictive check (limiting the x-scale to make it easier to see the distribution), the distributions are a bit higher than we want, we could contstrain the priors a bit more, but most of the mass of the distribution is between 0-10 so I think that's good enough. Now we can go onto fitting the model model and looking at the model diagnostics
+
+```{r}
+data_list$only_prior <- 0
+model_fit <- model$sample(
+  data = data_list,
+  parallel_chains = 4,
+  refresh = 0
+)
+```
+
+## Model diagnostics
+
+```{r}
+#| output: true
+
+# checking Rhats
+plot_grid(
+  model_fit$summary(c(
+    "mu",
+    "is_home",
+    "att",
+    "def",
+    "att_sigma",
+    "def_sigma"
+  )) |>
+    select(variable, rhat) |>
+    ggplot(aes(x = rhat)) +
+    geom_histogram() +
+    ggtitle("Histograms of Rhat"),
+  model_fit$summary(c(
+    "mu",
+    "is_home",
+    "att",
+    "def",
+    "att_sigma",
+    "def_sigma"
+  )) |>
+    select(variable, ess_bulk) |>
+    ggplot(aes(x = ess_bulk)) +
+    geom_histogram() +
+    ggtitle("Histograms of ESS Bulk"),
+  model_fit$summary(c(
+    "mu",
+    "is_home",
+    "att",
+    "def",
+    "att_sigma",
+    "def_sigma"
+  )) |>
+    select(variable, ess_tail) |>
+    ggplot(aes(x = ess_tail)) +
+    geom_histogram() +
+    ggtitle("Histograms of ESS Tail")
+)
+```
+
+All the Rhats, and bulk and tail effective sample sizes look good and there were no problems during fitting. There are a few paramaters with ESS lower than the rest which may warrant a deeper look.
+
+```{r}
+#| output: true
+loo_res <- model_fit$loo()
+loo_res
+plot(loo_res)
+```
+
+The loo-cv results all look good.
+
+
+## Posterior Predictive Check
+
+```{r}
+#| output: true
+
+home_ppc <- ppc_bars(
+  yrep = (model_fit$draws("fit_home_goals") |> as_draws_matrix())[
+    sample(1:4000, 4000),
+  ],
+  y = data_list$home_goals
+)
+
+
+away_ppc <- ppc_bars(
+  yrep = (model_fit$draws("fit_away_goals") |> as_draws_matrix())[
+    sample(1:4000, 4000),
+  ],
+  y = data_list$away_goals
+)
+
+
+plot_grid(
+  home_ppc,
+  away_ppc,
+  labels = c('Home', 'Away'),
+  label_size = 12,
+  ncol = 1
+)
+
+```
+
+Looking at the posterior predictive distributions of the home and away goals, which is just comparing the distribution of goals as predicted by the model (labeled as y_rep) vs the distribution of goals seen in the data (the light blue bars). Overall it looks like the model predicts the number of goals well for the home games, but it seems to have some issues with the away goals.
+
+# Some Plots
+
+With this model, we can look at the latent variables $att_i$ and $def_i$ for each team and this would give us some information about the relative offensive and defensive ability of the each team
+
+```{r}
+#| output: true
+
+model_fit$summary(c("att")) |>
+  select(variable, median, q5, q95) |>
+  mutate(id = str_extract(variable, "\\d+") |> as.numeric()) |>
+  left_join(
+    x = _,
+    y = df$team_id
+  ) |>
+  select(-variable) |>
+  ggplot(aes(y = median, x = team)) +
+  geom_point() +
+  geom_linerange(aes(ymin = q5, ymax = q95)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  ggtitle("Att latent parameter (with 95% CI)") +
+  ylab("median (higher is better)")
+```
+
+```{r}
+#| output: true
+
+model_fit$summary(c("def")) |>
+  select(variable, median, q5, q95) |>
+  mutate(id = str_extract(variable, "\\d+") |> as.numeric()) |>
+  left_join(
+    x = _,
+    y = df$team_id
+  ) |>
+  select(-variable) |>
+  ggplot(aes(y = median, x = team)) +
+  geom_point() +
+  geom_linerange(aes(ymin = q5, ymax = q95)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  ggtitle("Def latent parameter (with 95% CI)") +
+  ylab("median (lower is better)")
+```
+
+We can plot the offensive and defensive parameters together in a single plot:
+
+```{r}
+#| output: true
+
+model_fit$summary(c("att", "def")) |>
+  select(variable, median) |>
+  mutate(
+    id = str_extract(variable, "\\d+") |> as.numeric(),
+    type = if_else("att" == substr(variable, 1, 3), "att", "def")
+  ) |>
+  select(-variable) |>
+  left_join(
+    x = _,
+    y = df$team_id
+  ) |>
+  select(-id) |>
+  pivot_wider(
+    id_cols = c("team"),
+    names_from = "type",
+    values_from = "median"
+  ) |>
+  ggplot(aes(x = att, y = def, label = team)) +
+  geom_text() +
+  geom_vline(xintercept = 0, linetype = 2) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  xlab("Offensive Latent Parameter (higher is better)") +
+  ylab("Defensive Latent Parameter (lower is better)")
+
+```
+
+
+
+
+# Predicting Games
+
+The goal for this model is to predict who will win a game, so let's try and do that. To test how good this model is for predicting a game on the $i$ th day, we will fit the model using all the data from days $i = 1, ..., i-1$, sample from the posterior predicitive distribution of goals for the home team and away team for each of the games, compare which team has the higher avg(goal) value.
+
+
+```{r}
+dates_to_pred <- (df$model_df$date |> unique() |> sort())[-c(1)]
+
+test_model <- function(dat, dates, model){
+  preds <- map(dates, \(d) {
+    df_train <- dat$model_df |> filter(date < as.Date(d))
+    df_test <- dat$model_df |> filter(date == as.Date(d))
+
+    data_list <- list(
+      N = df_train |> nrow(),
+      n_teams = df$team_id |> nrow(),
+      home_goals = df_train$home_goals,
+      away_goals = df_train$away_goals,
+      home_teams = df_train$home_id,
+      away_teams = df_train$away_id,
+      N_new = df_test |> nrow(),
+      home_new = df_test$home_id,
+      away_new = df_test$away_id,
+      only_prior = 0
+    )
+
+    model_fit <- model$sample(
+      data = data_list,
+      parallel_chains = 4,
+      refresh = 2000
+    )
+
+    bind_cols(
+      "game_id" = df_test$game_id,
+      "home" = model_fit$draws("pred_home_goals") |>
+        as_draws_df() |>
+        select(-c(".chain", ".iteration", ".draw")) |>
+        apply(X = _, MARGIN = 2, FUN = mean),
+      "away" = model_fit$draws("pred_away_goals") |>
+        as_draws_df() |>
+        select(-c(".chain", ".iteration", ".draw")) |>
+        apply(X = _, MARGIN = 2, FUN = mean)
+    ) |>
+      mutate(
+        home_team_win = if_else(
+          home > away,
+          1,
+          0
+        ),
+        actual_home_team_win = if_else(
+          df_test$home_goals > df_test$away_goals,
+          1,
+          0
+        ),
+        correct_pred = if_else(home_team_win == actual_home_team_win, 1, 0)
+      )
+  }) |>
+    bind_rows()
+
+  return(preds)
+}
+
+# caching results
+if(file.exists(here("posts", "nhl_goal_modelling", "pred_model.csv"))){
+  preds <- read_csv(here("posts", "nhl_goal_modelling", "pred_model.csv"))
+} else{
+  preds <- test_model(df, dates_to_pred, model)
+  preds |> write_csv(here("posts", "nhl_goal_modelling", "pred_model.csv"))
+}
+
+
+```
+
+```{r}
+#| output: true
+cat("Accuracy:", 100 * (preds$correct_pred |> mean()), "%\n")
+```
+
+
+```{r}
+#| output: true
+preds |>
+  mutate(cum_mean = cummean(correct_pred), game_num = 1:n()) |>
+  ggplot(aes(x = game_num, y = cum_mean)) +
+  geom_line() +
+  geom_hline(yintercept = 0.5, linetype = 2) +
+  xlab("Game Number") +
+  ylab("Cumulative Accuracy")
+```
+
+
+
+# Predicting the 2025-2026 season
+We can use this model to predict the final points standings of the 2025-2026 regular season. Shown in the boxplot below
+
+```{r}
+get_reg_scheduled_games <- function(first_date, last_date) {
+  if (as.Date(first_date) > as.Date(last_date)) {
+    stop("first_date > last_date")
+  }
+
+  # dates should be formatted as YYYY-MM-DD
+  date_range <- seq(ymd(first_date), ymd(last_date), by = "day") |>
+    format("%Y-%m-%d")
+
+  fetch_games <- function(d) {
+    url <- paste0("https://api-web.nhle.com/v1/schedule/", d)
+
+    resp <- try(GET(url), silent = TRUE)
+    if (inherits(resp, "try-error") || http_error(resp)) {
+      return(NULL)
+    }
+    data <- content(resp, as = "parsed", type = "application/json")
+    games <- data$gameWeek[[1]]$games
+    if (is.null(games)) {
+      return(NULL)
+    }
+    games_df <- map_dfr(games, function(g) {
+      if (g$gameType == 2) {
+        tibble(
+          date = d,
+          game_id = g$id,
+          away_team = g$awayTeam$abbrev,
+          home_team = g$homeTeam$abbrev
+        )
+      } else {
+        NULL
+      }
+    })
+    games_df
+  }
+  map_dfr(date_range, fetch_games)
+}
+
+
+# getting all the regular season games in the 2025-2026 nhl season
+all_reg_games <- get_reg_scheduled_games("2025-10-07", "2026-04-20") |>
+  left_join(
+    df$team_id |>
+      mutate(away_team = team, away_id = id) |>
+      select(-c("team", "id"))
+  ) |>
+  left_join(
+    df$team_id |>
+      mutate(home_team = team, home_id = id) |>
+      select(-c("team", "id"))
+  )
+
+# fitting model
+data_list$home_new <- all_reg_games$home_id
+data_list$away_new <- all_reg_games$away_id
+data_list$N_new <- nrow(all_reg_games)
+data_list$only_prior <- 0
+model_fit_pred <- model$sample(
+  data = data_list,
+  seed = 123,
+  refresh = 0,
+  parallel_chains = 4
+)
+
+
+```
+
+
+
+```{r}
+#| output: true
+
+pred_home_goals <- model_fit_pred$draws("pred_home_goals") |>
+  as_draws_df() |>
+  select(-c(".chain", ".iteration", ".draw"))
+
+pred_away_goals <- model_fit_pred$draws("pred_away_goals") |>
+  as_draws_df() |>
+  select(-c(".chain", ".iteration", ".draw"))
+
+
+season_sim <- map(1:ncol(pred_home_goals), \(i) {
+  home_goal_rate <- mean(pred_home_goals[[i]])
+  away_goal_rate <- mean(pred_away_goals[[i]])
+  final_decision <- as.numeric(home_goal_rate > away_goal_rate)
+
+  res <- if_else(
+    pred_home_goals[i] > pred_away_goals[i],
+    1,
+    if_else(
+      pred_home_goals[i] < pred_away_goals[i],
+      0,
+      final_decision
+    )
+  )
+
+  bind_rows(
+    tibble(
+      "team" = all_reg_games$home_team[i],
+      "game_num" = i,
+      "sim_points" = 2 * (res == 1),
+      "sim_num" = 1:length(res)
+    ),
+    tibble(
+      "team" = all_reg_games$away_team[i],
+      "game_num" = i,
+      "sim_points" = 2 * (res == 0),
+      "sim_num" = 1:length(res)
+    )
+  )
+}) |>
+  bind_rows()
+
+season_sim |>
+  group_by(team, sim_num) |>
+  summarise(points = sum(sim_points)) |>
+  ggplot(aes(y = team, x = points)) +
+  geom_boxplot()
+```
+
+
+Table of Avg predicted points
+```{r}
+#| output: true
+
+knitr::kable(
+  season_sim |>
+    group_by(team, sim_num) |>
+    summarise(points = sum(sim_points)) |>
+    ungroup() |>
+    group_by(team) |>
+    summarise(avg_points = mean(points)) |>
+    arrange(desc(avg_points)),
+  format = "html"
+)
+```
+
+# Looking to the Future
+
+There is a lot that this model is not accounting for. For one, it's only looking at the final goal results, splitting it up into regulation, OT and shootout could be a way to improve it. Another glaring flaw of this method is that it doesn't take into account the players skill in any way, or any other information other than the goals scored and home/away status.
